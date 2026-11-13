@@ -828,7 +828,7 @@ function newGame(seats,diff,scn,opts){
   gameGen++;closeModal();shownOver=false;MODAL_REDRAW=null;scn=SCENARIOS[scn]?scn:'shores';
   const B=buildBoard(scn);const sc=SCENARIOS[scn];const used=seats.map(s=>s.name).filter(Boolean);const bots=BOTNAMES.filter(n=>!used.includes(n));let bi=0;
   G={...B,boardId:Math.random().toString(36).slice(2),n:seats.length,diff:diff||'normal',vpGoal:sc.vp,
-    players:seats.map((s,i)=>({id:i,name:s.kind==='bot'?bots[bi++]:(s.name||'Oyuncu '+(i+1)),color:COLORS[i],kind:s.kind,isBot:s.kind==='bot',
+    players:seats.map((s,i)=>({id:i,name:s.kind==='bot'&&!s.away?bots[bi++]:(s.name||'Oyuncu '+(i+1)),cid:s.cid||null,disconnected:!!s.away,color:COLORS[i],kind:s.kind,isBot:s.kind==='bot',
       res:{wood:0,brick:0,sheep:0,wheat:0,ore:0},dev:[],newDev:[],vpCards:0,knights:0,settlements:[],cities:[],roads:[],ships:[],roadLen:0,chips:0,home:[],claimed:[],cloth:0,heldPorts:[],trade:[]})),
     bank:{wood:19,brick:19,sheep:19,wheat:19,ore:19},
     devDeck:shuffle([...Array(14).fill('knight'),...Array(5).fill('vp'),'road','road','plenty','plenty','monopoly','monopoly']),
@@ -1809,18 +1809,26 @@ function sendLobby(){for(const k in NET.conns)sendTo(+k,{t:'lobby',code:NET.code
 function hostData(conn,d){
   if(!d||typeof d!=='object')return;conn.lastSeen=Date.now();if(d.t==='ping')return;
   if(d.t==='join'){
-    const nm=String(d.name||'Arkadaş').trim().slice(0,16)||'Arkadaş';
+    const nm=String(d.name||'Arkadaş').trim().slice(0,16)||'Arkadaş',cid=String(d.cid||'').slice(0,40);
+    const live=i=>!!NET.conns[i]&&NET.conns[i]!==conn;
     if(!NET.inLobby&&G&&G.players&&G.players.length&&G.phase!=='over'){
-      const p=G.players.find(p=>p.kind==='remote'&&p.name===nm)||G.players.find(p=>p.disconnected&&p.name===nm)||G.players.find(p=>p.kind==='remote'&&!NET.conns[p.id])||G.players.find(p=>p.disconnected);
+      // önce aynı tarayıcı (kimlik), sonra kopmuş koltuklar; canlı bir koltuk asla başkasına verilmez
+      let p=cid&&G.players.find(p=>p.cid===cid&&p.kind!=='local');
+      if(!p)p=G.players.find(p=>p.disconnected&&p.name===nm&&!live(p.id))||G.players.find(p=>p.kind==='remote'&&!live(p.id))||G.players.find(p=>p.disconnected&&!live(p.id));
       if(!p){conn.send({t:'reject',reason:'Oyun başlamış ve boş koltuk yok.'});return;}
       const old=NET.conns[p.id];if(old&&old!==conn){old.seat=null;delete NET.conns[p.id];try{old.close();}catch(e){}}
-      const wasBot=p.isBot;p.isBot=false;p.kind='remote';p.disconnected=false;conn.seat=p.id;NET.conns[p.id]=conn;NET.seats[p.id].conn=conn;NET.seats[p.id].kind='remote';
-      conn.send({t:'joined',seat:p.id,code:NET.code});voiceBroadcast();if(wasBot)log(`🌐 ${name(p)} geri döndü.`);broadcastNow();renderAll();
+      const wasBot=p.isBot;p.isBot=false;p.kind='remote';p.disconnected=false;p.cid=cid||p.cid;conn.seat=p.id;NET.conns[p.id]=conn;
+      if(NET.seats[p.id]){NET.seats[p.id].conn=conn;NET.seats[p.id].kind='remote';NET.seats[p.id].cid=p.cid;NET.seats[p.id].name=p.name;}
+      conn.send({t:'joined',seat:p.id,code:NET.code});voiceBroadcast();if(wasBot)log(`🌐 ${name(p)} geri döndü ve koltuğunu geri aldı.`);broadcastNow();renderAll();
       if(NET.resumeWait)showResumeWait();return;
     }
-    const i=NET.seats.findIndex(s=>s.kind==='remote'&&!s.conn);
-    if(i<0||!NET.inLobby){conn.send({t:'reject',reason:'Oda dolu.'});return;}
-    NET.seats[i].conn=conn;NET.seats[i].name=nm;conn.seat=i;NET.conns[i]=conn;conn.send({t:'joined',seat:i,code:NET.code});voiceBroadcast();sendLobby();showHostLobby();return;
+    if(!NET.inLobby){conn.send({t:'reject',reason:'Oyun şu an bitti; kurucu yeni oyunu başlatınca tekrar katıl.'});return;}
+    let i=cid?NET.seats.findIndex(s=>s.kind==='remote'&&s.cid===cid):-1;
+    if(i<0)i=NET.seats.findIndex(s=>s.kind==='remote'&&!s.conn&&!s.cid);
+    if(i<0)i=NET.seats.findIndex(s=>s.kind==='remote'&&!s.conn);
+    if(i<0){conn.send({t:'reject',reason:'Oda dolu.'});return;}
+    const old=NET.seats[i].conn;if(old&&old!==conn){old.seat=null;try{old.close();}catch(e){}}
+    NET.seats[i].conn=conn;NET.seats[i].name=nm;NET.seats[i].cid=cid;conn.seat=i;NET.conns[i]=conn;conn.send({t:'joined',seat:i,code:NET.code});voiceBroadcast();sendLobby();showHostLobby();return;
   }
   if(conn.seat==null||NET.conns[conn.seat]!==conn)return;
   if(d.t==='voice'){voiceHostMsg(conn.seat,d);return;}
@@ -1842,8 +1850,8 @@ function hostClose(conn){
   renderAll();
 }
 function startHostedGame(){
-  const seats=NET.seats.map(s=>s.kind==='remote'&&!s.conn?{kind:'bot'}:{kind:s.kind,name:s.name});
-  NET.seats.forEach(s=>{if(s.kind==='remote'&&!s.conn)s.kind='bot';});
+  const seats=NET.seats.map(s=>s.kind==='remote'&&!s.conn?(s.cid?{kind:'bot',name:s.name,cid:s.cid,away:true}:{kind:'bot'}):{kind:s.kind,name:s.name,cid:s.cid});
+  NET.seats.forEach(s=>{if(s.kind==='remote'&&!s.conn&&!s.cid)s.kind='bot';});
   NET.inLobby=false;ME=0;newGame(seats,NET.diff,NET.scn,NET.opts);
 }
 function closeRoom(){voiceReset();for(const k in NET.conns)sendTo(+k,{t:'closed'});const pr=NET.peer;setTimeout(()=>{try{pr&&pr.destroy();}catch(e){}},200);NET.peer=null;
@@ -1859,7 +1867,7 @@ function joinRoom(code,nm,retry){
   NET.peer=peer;
   peer.on('call',onIncomingCall);
   peer.on('open',()=>{const conn=peer.connect(PEER_PREFIX+code,{reliable:true});NET.conn=conn;
-    conn.on('open',()=>{NET.hostSeen=Date.now();conn.send({t:'join',name:nm});});
+    conn.on('open',()=>{NET.hostSeen=Date.now();conn.send({t:'join',name:nm,cid:CLIENT_ID});});
     conn.on('data',clientData);
     conn.on('close',()=>{if(NET.conn===conn&&NET.joined)clientLost();});});
   peer.on('error',err=>{if(NET.peer!==peer)return;if(NET.joined){if(err.type!=='peer-unavailable')clientLost();}else onJoinFail(err);});
@@ -1918,6 +1926,7 @@ function backToMenu(){
   menuBoard();showStart();
 }
 let startCfg={cnt:4,kinds:['local','bot','bot','bot'],diff:'normal',game:'base',scn:'shores',hidden:false,tab:'new'};
+const CLIENT_ID=(()=>{let c=lsGet('adakol2-cid');if(!c){c=Math.random().toString(36).slice(2)+Date.now().toString(36);lsSet('adakol2-cid',c);}return c;})();
 function ago(t){const m=Math.round((Date.now()-t)/60000);return m<1?'az önce':m<60?m+' dk önce':Math.round(m/60)+' saat önce';}
 const effScn=c=>c.game==='base'?'classic':c.scn;
 const SCN_NUM={shores:1,four:2,oceania:3,desert:4,tribe:5,cloth:6,pirates:7,wonders:8,newworld:'★'};
@@ -1980,13 +1989,13 @@ function showHostLobby(){
   const box=openModal(`<h2>🌐 Oyun odası</h2>${st}
     <p>Arkadaşın oyunu açıp <b>“Davete katıl”</b> bölümüne bu kodu girsin:</p>
     <div class="codebox"><span>${NET.code}</span><button id="cp" class="vbtn">📋 Davet metnini kopyala</button></div>
-    ${NET.seats.map((s,i)=>`<div class="seat"><span class="dot" style="background:${COLORS[i]}"></span><span style="flex:1">${s.kind==='local'?`<b>${esc(s.name)}</b> (sen)`:s.kind==='bot'?'🤖 Bot':s.conn?`🌐 <b>${esc(s.name)}</b> <span class="ok">✓ bağlandı</span>`:'🌐 <i style="color:var(--muted)">Arkadaş bekleniyor…</i>'}</span></div>`).join('')}
+    ${NET.seats.map((s,i)=>`<div class="seat"><span class="dot" style="background:${COLORS[i]}"></span><span style="flex:1">${s.kind==='local'?`<b>${esc(s.name)}</b> (sen)`:s.kind==='bot'?'🤖 Bot':s.conn?`🌐 <b>${esc(s.name)}</b> <span class="ok">✓ bağlandı</span>`:s.cid?`🔌 <b>${esc(s.name)}</b> <span class="err">bağlantısı koptu — bekleniyor…</span>`:'🌐 <i style="color:var(--muted)">Arkadaş bekleniyor…</i>'}</span></div>`).join('')}
     <p class="small">Oyun: <b>${SCENARIOS[NET.scn||'classic'].game==='base'?'Catan':'Denizciler — '+SCENARIOS[NET.scn].name}</b> (${SCENARIOS[NET.scn||'classic'].vp} puan) · Bot zorluğu: ${DIFFNAME[NET.diff||'normal']}${NET.opts&&NET.opts.hidden?' · 🙈 Araziler kapalı':''}</p>
     <div class="actions"><button id="x">Odayı kapat</button><button class="primary" id="st" ${NET.status==='open'||!anyR?'':'disabled'}>${filled?'Oyunu başlat':'Boş yerlere bot koy ve başlat'}</button></div>`);
   box.onclick=e=>{const b=e.target.closest('button');if(!b)return;
     if(b.id==='cp'){const t=inviteText();(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{b.textContent='✓ Kopyalandı';},()=>{prompt('Davet metnini kopyala:',t);});}
     if(b.id==='x'){closeRoom();menuBoard();showStart();}
-    if(b.id==='st'&&!b.disabled)startHostedGame();};
+    if(b.id==='st'&&!b.disabled){const away=NET.seats.filter(s=>s.kind==='remote'&&!s.conn);if(away.length&&!confirm(`${away.map(s=>s.name||'Arkadaş').join(', ')} şu an bağlı değil. Başlarsan yerine bot oynar; geri gelince kendi koltuğunu geri alır. Başlatılsın mı?`))return;startHostedGame();}};
   updateNetInfo();
 }
 function showClientLobby(msg,err){
